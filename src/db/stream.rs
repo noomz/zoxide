@@ -4,6 +4,7 @@ use std::path::Path;
 use std::{fs, path};
 
 use glob::Pattern;
+use strsim::normalized_levenshtein;
 
 use crate::db::{Database, Dir, Epoch};
 use crate::util::{self, MONTH};
@@ -83,8 +84,25 @@ impl<'a> Stream<'a> {
             None => return true,
         };
 
-        let path = util::to_lowercase(path);
-        let mut path = path.as_str();
+        let path_lower = util::to_lowercase(path);
+
+        // First, try exact substring matching (fast path)
+        if self.filter_by_keywords_exact(&path_lower, keywords_last, keywords) {
+            return true;
+        }
+
+        // Fall back to fuzzy matching
+        self.filter_by_keywords_fuzzy(&path_lower, keywords_last, keywords)
+    }
+
+    /// Exact substring matching (original behavior)
+    fn filter_by_keywords_exact(
+        &self,
+        path: &str,
+        keywords_last: &str,
+        keywords: &[String],
+    ) -> bool {
+        let mut path = path;
         match path.rfind(keywords_last) {
             Some(idx) => {
                 if path[idx + keywords_last.len()..].contains(path::is_separator) {
@@ -103,6 +121,68 @@ impl<'a> Stream<'a> {
         }
 
         true
+    }
+
+    /// Fuzzy matching using Jaro-Winkler similarity
+    fn filter_by_keywords_fuzzy(
+        &self,
+        path: &str,
+        keywords_last: &str,
+        keywords: &[String],
+    ) -> bool {
+        // Skip fuzzy matching if any keyword contains a path separator
+        // (path separators have special semantic meaning)
+        if keywords_last.contains(path::is_separator)
+            || keywords.iter().any(|k| k.contains(path::is_separator))
+        {
+            return false;
+        }
+
+        const FUZZY_THRESHOLD: f64 = 0.7;
+
+        // Split path into components for fuzzy matching
+        let components: Vec<&str> = path
+            .split(path::is_separator)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if components.is_empty() {
+            return false;
+        }
+
+        // Last keyword must fuzzy-match the last component
+        let last_component = components.last().unwrap();
+        if !Self::fuzzy_matches(keywords_last, last_component, FUZZY_THRESHOLD) {
+            return false;
+        }
+
+        // Remaining keywords must match remaining components (in order, from back)
+        let mut comp_idx = components.len() - 1;
+        for keyword in keywords.iter().rev() {
+            let mut found = false;
+            while comp_idx > 0 {
+                comp_idx -= 1;
+                if Self::fuzzy_matches(keyword, components[comp_idx], FUZZY_THRESHOLD) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Check if keyword fuzzy-matches a component
+    fn fuzzy_matches(keyword: &str, component: &str, threshold: f64) -> bool {
+        // Substring match
+        if component.contains(keyword) {
+            return true;
+        }
+        // Normalized Levenshtein similarity (1.0 = identical, 0.0 = completely different)
+        normalized_levenshtein(keyword, component) >= threshold
     }
 }
 
@@ -202,6 +282,14 @@ mod tests {
     #[case(&["foo", "o", "bar"], "/foo/bar", false)]
     #[case(&["/foo/", "/bar"], "/foo/bar", false)]
     #[case(&["/foo/", "/bar"], "/foo/baz/bar", true)]
+    // Fuzzy matching - typos in last component
+    #[case(&["opensourec"], "/Projects/opensource", true)]  // 1 typo
+    #[case(&["opensoruce"], "/Projects/opensource", true)]  // transposition
+    #[case(&["prjects"], "/home/Projects", true)]           // typo matches last component
+    #[case(&["prjects", "opensourec"], "/Projects/opensource", true)] // typos in both
+    // Fuzzy matching - too different (should not match)
+    #[case(&["xyz"], "/Projects/opensource", false)]
+    #[case(&["completely_different"], "/foo/bar", false)]
     fn query(#[case] keywords: &[&str], #[case] path: &str, #[case] is_match: bool) {
         let db = &mut Database::new(PathBuf::new(), Vec::new(), |_| Vec::new(), false);
         let options = StreamOptions::new(0).with_keywords(keywords.iter());

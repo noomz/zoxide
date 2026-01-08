@@ -1003,6 +1003,7 @@ dependencies = [
  "rstest",
  "rstest_reuse",
  "serde",
+ "strsim",
  "tempfile",
  "which",
 ]
